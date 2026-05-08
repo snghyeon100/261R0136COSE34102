@@ -63,9 +63,16 @@ use_lora: true
 lora_r: 8
 lora_alpha: 16
 lora_dropout: 0.05
-# null이면 find_all_linear_names()로 자동 감지
+# null이면 find_all_linear_names()로 자동 감지 (leaf 이름: q_proj, k_proj 등)
+# select_modules.py 결과를 적용할 때는 풀 이름 리스트를 직접 지정:
+#   lora_target_modules:
+#     - model.layers.8.self_attn.q_proj
+#     - model.layers.10.mlp.up_proj
+#     - ...
+# 이 경우 lora_target_layers는 null로 두세요 (풀 이름이 이미 레이어 정보를 포함).
 lora_target_modules: null
 # 특정 레이어에만 LoRA를 부착할 경우 리스트 지정 (예: [8, 9, 10, 11, 12, 13, 14, 15, 16, 17])
+# select_layers.py 결과를 여기에 반영. select_modules.py 사용 시에는 null로 두세요.
 lora_target_layers: null
 
 # LoRA adapter 저장 경로 (Stage 2 extract_lora_delta.py가 이 경로를 읽음)

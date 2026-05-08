@@ -4,6 +4,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler, default_data_collator, \
     DataCollatorForLanguageModeling
 from torch.optim import AdamW
+import bitsandbytes as bnb
 from tqdm.auto import tqdm
 from itertools import cycle
 from loss_utils import *
@@ -13,7 +14,12 @@ from loss_utils import *
 def train_loop(model, pretrained_model, train_dataloader, train_unk_dataloader, normal_dataloader, logger,
                learning_rate=1e-6, unlearn_loss="npo",
                kl_weight=1., unlearn_weight=1., unk_weight=1.):
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
+    # VRAM 절약을 위해 Gradient Checkpointing 활성화
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+
+    # CPU Paging을 지원하는 PagedAdamW32bit 옵티마이저 사용
+    optimizer = bnb.optim.PagedAdamW32bit(model.parameters(), lr=learning_rate)
     num_epochs = 1
     num_training_steps = num_epochs * len(train_dataloader)
     lr_scheduler = get_scheduler(
