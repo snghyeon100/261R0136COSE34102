@@ -1,0 +1,99 @@
+# LingTea adapted to source-language unlearning and cross-lingual propagation eval.
+
+model_family: qwen3_5_2b
+model_path: ./finetuned/epoch5
+method_name: LingTea
+
+# Train forget only on this language. Target languages are evaluation-only.
+source_language: en
+target_languages: [ar, fa, fr, hi, id, iw, ja, ko, ru]
+
+source_data_path: locuslab/TOFU
+source_forget_path: null
+forget_split: forget01
+source_retain_split: retain99
+retain_multi_path: ./dataset/retain99_merged_all_10_lang
+
+question_key: question
+answer_key: answer
+max_length: 500
+max_train_examples: null
+max_retain_examples: null
+
+lr: 2e-5
+batch_size: 1
+gradient_accumulation_steps: 1
+num_epochs: 5
+max_steps: null
+warmup_ratio: 0.03
+weight_decay: 0.01
+max_grad_norm: 1.0
+optim: adamw_torch
+seed: 42
+
+temperature: 1.0
+loss_weights:
+  forget: 1.0
+  retain: 1.0
+
+bf16: false
+fp16: true
+gradient_checkpointing: false
+gpu_train: 0
+gpu_teacher: 1
+
+save_dir: ./finetuned/${method_name}_${lr}_${forget_split}_${num_epochs}_${source_language}
+overwrite_dir: false
+save_model: true
+eval_while_train: false
+eval_only: false
+run_eval_after_train: true
+log_steps: 5
+
+tokenizer_path: null
+prefer_checkpoint_tokenizer: true
+
+eval:
+  model_path: ${..save_dir}
+  model_family: ${..model_family}
+  tokenizer_path: ${..tokenizer_path}
+  prefer_checkpoint_tokenizer: true
+  use_pretrained: false
+  languages: null
+  language: ${..source_language}
+  split: ${..forget_split}_perturbed
+  english_data_path: ${..source_data_path}
+  data_root: ./dataset
+  save_dir: ${..save_dir}/eval_results
+
+  generation:
+    max_length: 200
+    max_new_tokens: 128
+
+  input_max_length: ${..max_length}
+  unicode_normalization: NFC
+  normalize_languages:
+    - hi
+
+  save_raw_logs: false
+  save_generated_text: false
+  compute_generation_metrics: false
+  save_case_studies: true
+  case_study_k: 3
+  case_study_seed: 42
+  save_legacy_aggregate_stat: false
+  ds_size: null
+  overwrite: true
+  batch_size: 4
+  perturb_eval_chunk_size: 1
+  reinitialize_weights: false
+
+  question_key: [question, question, question, question]
+  answer_key: [answer, answer, answer, answer]
+  base_answer_key: [paraphrased_answer, answer, answer, paraphrased_answer]
+  perturbed_answer_key: [perturbed_answer, perturbed_answer, perturbed_answer, perturbed_answer]
+  eval_task: [eval_log, eval_real_author_wo_options, eval_real_world_wo_options, eval_log_forget]
+
+  retain_result: null
+  retain_result_by_language: null
+  retain_result_template: null
