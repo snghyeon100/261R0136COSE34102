@@ -41,13 +41,18 @@ fp16: true
 gradient_checkpointing: false
 gpu_train: 0
 gpu_teacher: 1
+teacher_device: auto  # auto | local_rank | cpu | cuda:N. In torchrun, auto uses local_rank.
+
+# Full fine-tuning on 12GB GPUs needs ZeRO-3 sharding. Launch with torchrun.
+use_deepspeed: true
+deepspeed_config: ./unlearning_methods/unlearn_LingTea/ds_config_zero3.json
 
 save_dir: ./finetuned/${method_name}_${lr}_${forget_split}_${num_epochs}_${source_language}
 overwrite_dir: false
 save_model: true
 eval_while_train: false
 eval_only: false
-run_eval_after_train: true
+run_eval_after_train: false
 log_steps: 5
 
 tokenizer_path: null
