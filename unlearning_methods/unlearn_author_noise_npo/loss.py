@@ -16,11 +16,12 @@ def _batch_to_device(inputs, device):
 def compute_batch_nll(model, inputs):
     device = _model_device(model)
     input_ids, labels, attention_mask = _batch_to_device(inputs, device)
-    outputs = model(input_ids, labels=labels, attention_mask=attention_mask)
+    outputs = model(input_ids, attention_mask=attention_mask)
     logits = outputs.logits[..., :-1, :].contiguous()
     shifted_labels = labels[..., 1:].contiguous()
     loss_function = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
-    loss = loss_function(logits.transpose(-1, -2), shifted_labels).sum(dim=-1)
+    loss = loss_function(logits.view(-1, logits.size(-1)), shifted_labels.view(-1))
+    loss = loss.view(shifted_labels.size()).sum(dim=-1)
     return loss, outputs
 
 
@@ -36,11 +37,12 @@ def compute_batch_nll_with_author_noise(model, inputs, trigger_mask, noise_sigma
         embeds = embeds.clone()
         embeds[trigger_mask] = embeds[trigger_mask] + noise[trigger_mask]
 
-    outputs = model(inputs_embeds=embeds, labels=labels, attention_mask=attention_mask)
+    outputs = model(inputs_embeds=embeds, attention_mask=attention_mask)
     logits = outputs.logits[..., :-1, :].contiguous()
     shifted_labels = labels[..., 1:].contiguous()
     loss_function = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
-    loss = loss_function(logits.transpose(-1, -2), shifted_labels).sum(dim=-1)
+    loss = loss_function(logits.view(-1, logits.size(-1)), shifted_labels.view(-1))
+    loss = loss.view(shifted_labels.size()).sum(dim=-1)
     return loss, outputs
 
 
@@ -70,6 +72,15 @@ def compute_dpo_loss(model, ref_model, win_inputs=None, lose_inputs=None, beta=1
     return loss, (win_outputs, lose_outputs)
 
 
+def compute_dpo_loss_with_ref_nll(model, lose_inputs, ref_nll, beta=1.0):
+    device = _model_device(model)
+    lose_nll, outputs = compute_batch_nll(model, lose_inputs)
+    ref_nll = ref_nll.to(device=device, dtype=lose_nll.dtype)
+    lose_log_ratio = -(lose_nll - ref_nll)
+    loss = -2 / beta * F.logsigmoid(beta * (0.0 - lose_log_ratio)).mean()
+    return loss, outputs
+
+
 def compute_noisy_forget_npo_loss(model, ref_model, forget_inputs, trigger_mask, has_trigger, beta=1.0, noise_sigma=0.1):
     if ref_model is None:
         raise ValueError("Noisy NPO requires an oracle/reference model.")
@@ -96,6 +107,35 @@ def compute_noisy_forget_npo_loss(model, ref_model, forget_inputs, trigger_mask,
     return valid_loss, noisy_outputs, valid_ratio
 
 
+def compute_noisy_forget_npo_loss_with_ref_nll(
+    model,
+    forget_inputs,
+    trigger_mask,
+    has_trigger,
+    ref_nll,
+    beta=1.0,
+    noise_sigma=0.1,
+):
+    device = _model_device(model)
+    has_trigger = has_trigger.to(device=device, dtype=torch.bool)
+    if not has_trigger.any():
+        zero = next(model.parameters()).sum() * 0.0
+        return zero, None, zero.detach()
+
+    noisy_nll, noisy_outputs = compute_batch_nll_with_author_noise(
+        model,
+        forget_inputs,
+        trigger_mask=trigger_mask,
+        noise_sigma=noise_sigma,
+    )
+    ref_nll = ref_nll.to(device=device, dtype=noisy_nll.dtype)
+    lose_log_ratio = -(noisy_nll - ref_nll)
+    per_example_loss = -2 / beta * F.logsigmoid(beta * (0.0 - lose_log_ratio))
+    valid_loss = per_example_loss[has_trigger].mean()
+    valid_ratio = has_trigger.float().mean().detach()
+    return valid_loss, noisy_outputs, valid_ratio
+
+
 def compute_author_noise_npo_loss(
     model,
     oracle_model,
@@ -110,22 +150,40 @@ def compute_author_noise_npo_loss(
     forget_inputs = batch["forget"]
     retain_inputs = batch["retain"]
 
-    clean_forget_loss, forget_outputs = compute_dpo_loss(
-        model=model,
-        ref_model=oracle_model,
-        win_inputs=None,
-        lose_inputs=forget_inputs,
-        beta=beta,
-    )
-    noisy_forget_loss, _, trigger_ratio = compute_noisy_forget_npo_loss(
-        model=model,
-        ref_model=oracle_model,
-        forget_inputs=forget_inputs,
-        trigger_mask=batch["trigger_mask"],
-        has_trigger=batch["has_trigger"],
-        beta=beta,
-        noise_sigma=noise_sigma,
-    )
+    has_precomputed_ref = "reference_nll" in batch and torch.isfinite(batch["reference_nll"]).all()
+    if has_precomputed_ref:
+        clean_forget_loss, forget_outputs = compute_dpo_loss_with_ref_nll(
+            model=model,
+            lose_inputs=forget_inputs,
+            ref_nll=batch["reference_nll"],
+            beta=beta,
+        )
+        noisy_forget_loss, _, trigger_ratio = compute_noisy_forget_npo_loss_with_ref_nll(
+            model=model,
+            forget_inputs=forget_inputs,
+            trigger_mask=batch["trigger_mask"],
+            has_trigger=batch["has_trigger"],
+            ref_nll=batch["reference_nll"],
+            beta=beta,
+            noise_sigma=noise_sigma,
+        )
+    else:
+        clean_forget_loss, forget_outputs = compute_dpo_loss(
+            model=model,
+            ref_model=oracle_model,
+            win_inputs=None,
+            lose_inputs=forget_inputs,
+            beta=beta,
+        )
+        noisy_forget_loss, _, trigger_ratio = compute_noisy_forget_npo_loss(
+            model=model,
+            ref_model=oracle_model,
+            forget_inputs=forget_inputs,
+            trigger_mask=batch["trigger_mask"],
+            has_trigger=batch["has_trigger"],
+            beta=beta,
+            noise_sigma=noise_sigma,
+        )
 
     retain_input_ids, retain_labels, retain_attention_mask = _batch_to_device(retain_inputs, _model_device(model))
     retain_outputs = model(retain_input_ids, labels=retain_labels, attention_mask=retain_attention_mask)

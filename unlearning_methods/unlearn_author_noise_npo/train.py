@@ -20,12 +20,20 @@ import deepspeed
 import hydra
 import torch
 import transformers
+from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, set_seed
 from transformers.integrations.deepspeed import deepspeed_init
 
 from evaluate_util import get_all_evals, get_dataloader
 from unlearning_methods.unlearn_author_noise_npo.dataloader import AuthorNoiseNPODataset, author_noise_npo_collator
-from unlearning_methods.unlearn_author_noise_npo.loss import compute_author_noise_npo_loss
+from unlearning_methods.unlearn_author_noise_npo.loss import (
+    compute_author_noise_npo_loss,
+    compute_batch_nll,
+    compute_dpo_loss,
+    compute_dpo_loss_with_ref_nll,
+    compute_noisy_forget_npo_loss,
+    compute_noisy_forget_npo_loss_with_ref_nll,
+)
 from utils import get_forget_quality, get_model_identifiers_from_yaml, get_model_utility, merge_dicts
 
 
@@ -67,9 +75,8 @@ class AuthorNoiseNPOTrainer(Trainer):
         self.noise_sigma = noise_sigma
         self.language = language
         super().__init__(*args, **kwargs)
-        if self.oracle_model is None:
-            raise ValueError("AuthorNoiseNPOTrainer requires an oracle/reference model.")
-        self.oracle_model.eval()
+        if self.oracle_model is not None:
+            self.oracle_model.eval()
 
     def _wrap_model(self, model, training=True, dataloader=None):
         return model
@@ -117,6 +124,90 @@ class AuthorNoiseNPOTrainer(Trainer):
         if model.training:
             self.log({key: float(value.detach().float().cpu()) for key, value in logs.items()})
         return (loss, outputs) if return_outputs else loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Backward each loss term separately to reduce peak activation memory."""
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        grad_accum = max(1, int(self.args.gradient_accumulation_steps))
+        logs = {}
+        total_detached = None
+
+        def _accumulate(name, weighted_loss):
+            nonlocal total_detached
+            loss_for_backward = weighted_loss / grad_accum
+            self.accelerator.backward(loss_for_backward)
+            detached = weighted_loss.detach()
+            total_detached = detached if total_detached is None else total_detached + detached
+            logs[name] = float(detached.float().cpu())
+
+        forget_inputs = inputs["forget"]
+        has_precomputed_ref = "reference_nll" in inputs and torch.isfinite(inputs["reference_nll"]).all()
+
+        with self.compute_loss_context_manager():
+            if float(self.clean_npo_weight) != 0:
+                if has_precomputed_ref:
+                    clean_loss, _ = compute_dpo_loss_with_ref_nll(
+                        model=model,
+                        lose_inputs=forget_inputs,
+                        ref_nll=inputs["reference_nll"],
+                        beta=self.beta,
+                    )
+                else:
+                    clean_loss, _ = compute_dpo_loss(
+                        model=model,
+                        ref_model=self.oracle_model,
+                        win_inputs=None,
+                        lose_inputs=forget_inputs,
+                        beta=self.beta,
+                    )
+                logs["loss_clean_npo_raw"] = float(clean_loss.detach().float().cpu())
+                _accumulate("loss_clean_npo", float(self.gamma) * float(self.clean_npo_weight) * clean_loss)
+
+            if float(self.noisy_npo_weight) != 0:
+                if has_precomputed_ref:
+                    noisy_loss, _, trigger_ratio = compute_noisy_forget_npo_loss_with_ref_nll(
+                        model=model,
+                        forget_inputs=forget_inputs,
+                        trigger_mask=inputs["trigger_mask"],
+                        has_trigger=inputs["has_trigger"],
+                        ref_nll=inputs["reference_nll"],
+                        beta=self.beta,
+                        noise_sigma=self.noise_sigma,
+                    )
+                else:
+                    noisy_loss, _, trigger_ratio = compute_noisy_forget_npo_loss(
+                        model=model,
+                        ref_model=self.oracle_model,
+                        forget_inputs=forget_inputs,
+                        trigger_mask=inputs["trigger_mask"],
+                        has_trigger=inputs["has_trigger"],
+                        beta=self.beta,
+                        noise_sigma=self.noise_sigma,
+                    )
+                logs["loss_noisy_npo_raw"] = float(noisy_loss.detach().float().cpu())
+                logs["trigger_batch_ratio"] = float(trigger_ratio.detach().float().cpu())
+                _accumulate("loss_noisy_npo", float(self.gamma) * float(self.noisy_npo_weight) * noisy_loss)
+
+            if float(self.alpha) != 0:
+                retain_input_ids, retain_labels, retain_attention_mask = (
+                    tensor.to(next(model.parameters()).device)
+                    for tensor in inputs["retain"]
+                )
+                retain_outputs = model(
+                    retain_input_ids,
+                    labels=retain_labels,
+                    attention_mask=retain_attention_mask,
+                    use_cache=False,
+                )
+                logs["loss_retain_raw"] = float(retain_outputs.loss.detach().float().cpu())
+                _accumulate("loss_retain", float(self.alpha) * retain_outputs.loss)
+
+        if total_detached is None:
+            total_detached = next(model.parameters()).sum().detach() * 0.0
+        logs["loss_total"] = float(total_detached.float().cpu())
+        self.log(logs)
+        return total_detached / grad_accum
 
     def prediction_step(self, model, inputs, prediction_loss_only: bool, ignore_keys=None):
         input_ids, labels, attention_mask = inputs
@@ -256,12 +347,14 @@ def build_training_args(cfg, max_steps, steps_per_epoch, batch_size):
         warmup_steps=max(1, steps_per_epoch),
         max_steps=max_steps,
         learning_rate=cfg.lr,
-        bf16=True,
-        bf16_full_eval=True,
+        bf16=use_bf16(cfg),
+        fp16=use_fp16(cfg),
+        bf16_full_eval=use_bf16(cfg),
+        fp16_full_eval=use_fp16(cfg),
         logging_steps=max(1, max_steps // 20),
         logging_dir=str(Path(cfg.save_dir) / "logs"),
         output_dir=cfg.save_dir,
-        optim="paged_adamw_32bit",
+        optim=str(cfg.get("optim", "paged_adamw_8bit")),
         save_strategy="steps" if cfg.save_model and (not cfg.eval_only) else "no",
         save_steps=steps_per_epoch,
         save_only_model=True,
@@ -270,7 +363,158 @@ def build_training_args(cfg, max_steps, steps_per_epoch, batch_size):
         eval_steps=steps_per_epoch,
         eval_strategy="steps" if cfg.eval_while_train else "no",
         seed=cfg.seed,
+        remove_unused_columns=False,
     )
+
+
+def resolve_torch_device(value):
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    value = str(value)
+    if value == "auto":
+        return torch.device("cuda:0")
+    return torch.device(value)
+
+
+def model_dtype(cfg):
+    if not torch.cuda.is_available():
+        return torch.float32
+    if bool(cfg.get("bf16", True)) and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if bool(cfg.get("fp16", False)):
+        return torch.float16
+    if bool(cfg.get("bf16", True)) and not torch.cuda.is_bf16_supported():
+        print("bf16 requested but unsupported on this GPU; using fp16.")
+        return torch.float16
+    return torch.float32
+
+
+def use_bf16(cfg):
+    return bool(cfg.get("bf16", True)) and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
+
+def use_fp16(cfg):
+    return bool(cfg.get("fp16", False)) and torch.cuda.is_available() or (
+        bool(cfg.get("bf16", True)) and torch.cuda.is_available() and not torch.cuda.is_bf16_supported()
+    )
+
+
+def parse_torch_dtype(value):
+    value = str(value).lower()
+    if value in {"float32", "fp32"}:
+        return torch.float32
+    if value in {"float16", "fp16"}:
+        return torch.float16
+    if value in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    raise ValueError(f"Unsupported dtype: {value}")
+
+
+def collect_lora_targets(model, target_leaves):
+    if target_leaves is None:
+        target_leaves = sorted(
+            {
+                name.split(".")[-1]
+                for name, module in model.named_modules()
+                if isinstance(module, torch.nn.Linear) and name.split(".")[-1] != "lm_head"
+            }
+        )
+    target_leaves = set(str(name) for name in target_leaves)
+    targets = []
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if name.split(".")[-1] in target_leaves and "lm_head" not in name:
+            targets.append(name)
+    return targets
+
+
+def cast_trainable_parameters(model, dtype):
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(dtype=dtype)
+            if param.grad is not None:
+                param.grad = param.grad.to(dtype=dtype)
+
+
+def count_trainable_parameters(model):
+    trainable = 0
+    total = 0
+    for param in model.parameters():
+        total += param.numel()
+        if param.requires_grad:
+            trainable += param.numel()
+    return {
+        "trainable": trainable,
+        "total": total,
+        "trainable_fraction": trainable / max(1, total),
+    }
+
+
+def attach_lora_if_enabled(model, cfg):
+    if not bool(cfg.get("use_lora", True)):
+        print("LoRA disabled: full model parameters remain trainable.")
+        return model, None
+
+    from peft import LoraConfig, TaskType, get_peft_model
+
+    target_modules = collect_lora_targets(model, cfg.get("lora_target_modules", None))
+    if not target_modules:
+        raise ValueError("No LoRA target modules found.")
+    print(f"LoRA target module count: {len(target_modules)}")
+    print(f"LoRA target modules: {target_modules}")
+
+    lora_config = LoraConfig(
+        r=int(cfg.get("lora_r", 8)),
+        lora_alpha=int(cfg.get("lora_alpha", 16)),
+        target_modules=target_modules,
+        lora_dropout=float(cfg.get("lora_dropout", 0.05)),
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    model = get_peft_model(model, lora_config)
+    cast_trainable_parameters(model, parse_torch_dtype(cfg.get("trainable_param_dtype", "float32")))
+    model.print_trainable_parameters()
+    return model, target_modules
+
+
+def precompute_reference_nlls(cfg, dataset, model_cfg):
+    device = resolve_torch_device(cfg.get("reference_device", "cuda:0"))
+    dtype = model_dtype(cfg)
+    print(f"Precomputing reference NLLs on {device} and then freeing oracle model.")
+    oracle_model = AutoModelForCausalLM.from_pretrained(
+        cfg.model_path,
+        attn_implementation="flash_attention_2" if model_cfg["flash_attention2"] == "true" else None,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+    ).to(device)
+    oracle_model.eval()
+    for param in oracle_model.parameters():
+        param.requires_grad = False
+
+    loader = DataLoader(
+        dataset,
+        batch_size=int(cfg.get("reference_batch_size", 1)),
+        shuffle=False,
+        collate_fn=author_noise_npo_collator,
+    )
+    reference_nlls = [None] * len(dataset)
+    with torch.inference_mode():
+        for batch in loader:
+            nll, _ = compute_batch_nll(oracle_model, batch["forget"])
+            for idx, value in zip(batch["index"].tolist(), nll.detach().float().cpu().tolist()):
+                reference_nlls[int(idx)] = float(value)
+
+    del oracle_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    missing = [idx for idx, value in enumerate(reference_nlls) if value is None]
+    if missing:
+        raise RuntimeError(f"Missing reference NLLs for indices: {missing}")
+    dataset.set_reference_nlls(reference_nlls)
+    print("Reference NLL precompute complete.")
+    return reference_nlls
 
 
 @hydra.main(version_base=None, config_path=".", config_name="config")
@@ -317,25 +561,48 @@ def main(cfg):
     print(f"max_steps: {max_steps}")
     print("batch_size:", batch_size)
 
+    oracle_model = None
+    if bool(cfg.get("precompute_reference_nll", True)):
+        precompute_reference_nlls(cfg, dataset, model_cfg)
+    else:
+        print("precompute_reference_nll=false: keeping oracle model in memory during training.")
+        oracle_model = AutoModelForCausalLM.from_pretrained(
+            cfg.model_path,
+            attn_implementation="flash_attention_2" if model_cfg["flash_attention2"] == "true" else None,
+            torch_dtype=model_dtype(cfg),
+            trust_remote_code=True,
+        ).to(resolve_torch_device(cfg.get("reference_device", "cuda:1")))
+        oracle_model.eval()
+        for param in oracle_model.parameters():
+            param.requires_grad = False
+
     training_args = build_training_args(cfg, max_steps, steps_per_epoch, batch_size)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_path,
         attn_implementation="flash_attention_2" if model_cfg["flash_attention2"] == "true" else None,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=model_dtype(cfg),
         trust_remote_code=True,
     ).to("cuda:0")
-    oracle_model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_path,
-        attn_implementation="flash_attention_2" if model_cfg["flash_attention2"] == "true" else None,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    ).to("cuda:1")
-    oracle_model.eval()
 
     model.generation_config.do_sample = True
-    if model_cfg["gradient_checkpointing"] == "true":
+    if bool(cfg.get("gradient_checkpointing", False)) or model_cfg["gradient_checkpointing"] == "true":
         model.gradient_checkpointing_enable()
+    model.config.use_cache = False
+    model, lora_targets = attach_lora_if_enabled(model, cfg)
+    if bool(cfg.get("gradient_checkpointing", False)) or model_cfg["gradient_checkpointing"] == "true":
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+    model.config.use_cache = False
+
+    trainable_info = count_trainable_parameters(model)
+    trainable_info["lora_targets"] = lora_targets
+    Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
+    with open(Path(cfg.save_dir) / "trainable_parameters.json", "w") as f:
+        json.dump(trainable_info, f, indent=2)
 
     trainer = AuthorNoiseNPOTrainer(
         model=model,
@@ -355,7 +622,6 @@ def main(cfg):
         noise_sigma=cfg.noise_sigma,
         language=cfg.language,
     )
-    model.config.use_cache = False
 
     if cfg.eval_only:
         trainer.evaluate()

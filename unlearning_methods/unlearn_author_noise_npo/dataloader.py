@@ -103,6 +103,7 @@ class AuthorNoiseNPODataset(Dataset):
         else:
             self.forget_data = datasets.load_from_disk(data_path.forget)["train"]
             self.retain_data = datasets.load_from_disk(data_path.retain)["train"]
+        self.reference_nlls = None
 
     def __len__(self):
         return len(self.forget_data)
@@ -122,6 +123,13 @@ class AuthorNoiseNPODataset(Dataset):
             "missing": len(missing),
             "missing_indices": missing,
         }
+
+    def set_reference_nlls(self, reference_nlls):
+        if len(reference_nlls) != len(self.forget_data):
+            raise ValueError(
+                f"Expected {len(self.forget_data)} reference NLL values, got {len(reference_nlls)}"
+            )
+        self.reference_nlls = [float(value) for value in reference_nlls]
 
     def __getitem__(self, idx):
         retain_idx = (idx + torch.randint(0, len(self.retain_data), (1,)).item()) % len(self.retain_data)
@@ -161,10 +169,15 @@ class AuthorNoiseNPODataset(Dataset):
             self.language,
         )
         return {
+            "index": torch.tensor(idx, dtype=torch.long),
             "forget": forget_sample,
             "retain": retain_sample,
             "trigger_mask": trigger_mask,
             "has_trigger": torch.tensor(has_trigger, dtype=torch.bool),
+            "reference_nll": torch.tensor(
+                float("nan") if self.reference_nlls is None else self.reference_nlls[idx],
+                dtype=torch.float32,
+            ),
         }
 
 
@@ -180,9 +193,13 @@ def author_noise_npo_collator(samples):
     retain = _stack_tuples([sample["retain"] for sample in samples])
     trigger_mask = torch.stack([sample["trigger_mask"] for sample in samples])
     has_trigger = torch.stack([sample["has_trigger"] for sample in samples])
+    indices = torch.stack([sample["index"] for sample in samples])
+    reference_nll = torch.stack([sample["reference_nll"] for sample in samples])
     return {
+        "index": indices,
         "forget": forget,
         "retain": retain,
         "trigger_mask": trigger_mask,
         "has_trigger": has_trigger,
+        "reference_nll": reference_nll,
     }

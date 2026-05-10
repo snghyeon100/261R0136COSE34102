@@ -1,5 +1,5 @@
 model_family: qwen3_5_2b
-model_path: ./finetuned
+model_path: ./finetuned/finetuned_100
 method_name: author_noise_npo
 
 lr: 2e-5
@@ -8,10 +8,14 @@ language: en
 split: forget01
 data_path: locuslab/TOFU
 
-batch_size: 2
+batch_size: 1
 gradient_accumulation_steps: 1
 num_epochs: 5
 max_steps: null
+bf16: true
+fp16: false
+optim: paged_adamw_8bit
+gradient_checkpointing: true
 beta: 1.
 gamma: 1.
 alpha: 1.
@@ -23,6 +27,18 @@ noise_sigma: 0.1
 clean_npo_weight: 1.0
 noisy_npo_weight: 1.0
 skip_missing_trigger: true
+precompute_reference_nll: true
+reference_batch_size: 1
+reference_device: cuda:0
+
+use_lora: true
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target_modules:
+  - v_proj
+  - o_proj
+trainable_param_dtype: float32
 
 save_dir: ${model_path}/${method_name}_${lr}_${split}_${num_epochs}_${language}
 overwrite_dir: false
