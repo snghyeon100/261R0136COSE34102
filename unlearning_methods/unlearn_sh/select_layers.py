@@ -1,7 +1,7 @@
-"""Stage 0: Forget/Retain Gradient Ratio를 이용한 레이어 선택 스크립트.
+"""Stage 0: Author-noise Forget/Retain Gradient Ratio 레이어 선택 스크립트.
 
 특징:
-- Forget 데이터 NPO loss gradient 계산
+- Forget 데이터 author-noised NPO loss gradient 계산
 - Retain 데이터 CE loss gradient 계산
 - 파라미터 수로 정규화 (mean gradient squared)
 - Forget score가 median 이상인 레이어만 필터링 (Noise 방지)
@@ -31,8 +31,12 @@ import torch
 from omegaconf import OmegaConf
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from unlearning_methods.unlearn_sh.dataloader import RCPForgetDataset, rcp_collator
-from unlearning_methods.unlearn_sh.loss import compute_dpo_loss, compute_retain_loss
+from unlearning_methods.unlearn_author_noise_npo.dataloader import (
+    AuthorNoiseNPODataset,
+    author_noise_npo_collator,
+)
+from unlearning_methods.unlearn_author_noise_npo.loss import compute_noisy_forget_npo_loss
+from unlearning_methods.unlearn_sh.loss import compute_retain_loss
 from utils import get_model_identifiers_from_yaml
 
 
@@ -87,16 +91,22 @@ def main():
     oracle_model.eval()
 
     # ── 데이터 로드 ────────────────────────────────────────
-    dataset = RCPForgetDataset(
+    dataset = AuthorNoiseNPODataset(
         cfg.data_path,
         tokenizer=tokenizer,
         model_family=cfg.model_family,
         max_length=500,
         split=cfg.split,
         language=cfg.language,
+        authors=list(cfg.get("authors", [])),
+        skip_missing_trigger=True,
     )
+    print(f"Trigger stats: {dataset.trigger_stats()}")
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=cfg.batch_size, shuffle=True, collate_fn=rcp_collator
+        dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        collate_fn=author_noise_npo_collator,
     )
 
     # 타겟 파라미터 식별 (Linear weight만)
@@ -120,15 +130,18 @@ def main():
         if batch_idx >= args.num_batches:
             break
             
-        forget_inputs, retain_inputs = inputs
+        forget_inputs = inputs["forget"]
+        retain_inputs = inputs["retain"]
 
-        # 1. Forget NPO gradient
-        forget_loss, _ = compute_dpo_loss(
+        # 1. Author-noised forget NPO gradient
+        forget_loss, _, trigger_ratio = compute_noisy_forget_npo_loss(
             model=model,
             ref_model=oracle_model,
-            win_inputs=None,
-            lose_inputs=forget_inputs,
+            forget_inputs=forget_inputs,
+            trigger_mask=inputs["trigger_mask"],
+            has_trigger=inputs["has_trigger"],
             beta=cfg.beta,
+            noise_sigma=float(cfg.get("noise_sigma", 0.1)),
         )
         g_f = torch.autograd.grad(forget_loss, target_params, retain_graph=False, allow_unused=True)
         
@@ -167,7 +180,7 @@ def main():
                     retain_scores[l_idx] = retain_scores.get(l_idx, 0.0) + (gr_val.norm().item() ** 2) / p.numel()
 
         batch_idx += 1
-        print(f"  Batch {batch_idx}/{args.num_batches} processed.")
+        print(f"  Batch {batch_idx}/{args.num_batches} processed. trigger_ratio={trigger_ratio.item():.3f}")
 
     # 평균
     if batch_idx > 0:
@@ -215,6 +228,9 @@ def main():
         json.dump({
             "top_k": args.top_k,
             "num_batches": args.num_batches,
+            "selection_signal": "author_noised_npo_gradient_ratio",
+            "noise_sigma": float(cfg.get("noise_sigma", 0.1)),
+            "authors": list(cfg.get("authors", [])),
             "selected_layers": selected_layers,
             "layer_stats": {
                 l: {

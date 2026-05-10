@@ -32,6 +32,14 @@ beta: 1.0      # NPO beta
 gamma: 1.0     # (미사용, 호환성 유지용)
 alpha: 0.0     # Retain loss 가중치 (0.0: 순수 RCP 방어형, >0: Retain 강화형)
 
+# --- Author-noise localization ---
+# select_layers.py / select_modules.py에서 forget01의 두 author 이름에만
+# embedding noise를 주고 noisy NPO gradient로 layer/module을 선택합니다.
+authors:
+  - Basil Mahfouz Al-Kuwaiti
+  - Nikolai Abilov
+noise_sigma: 0.1
+
 # --- 수치 정밀도 ---
 # Titan XP (Pascal)는 bf16 미지원 → fp16: true 사용
 # A100/H100 등 Ampere 이상: bf16: true, fp16: false
