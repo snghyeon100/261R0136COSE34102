@@ -1,98 +1,106 @@
-# WJ: zero-shot cross-lingual likelihood unlearning
-#
-# Run from repo root:
-#   CUDA_VISIBLE_DEVICES=0,1 python unlearning_methods/unlearn_wj/train.py
+method_name: pce_icul
 
+model_path: ./finetuned/epoch5
 model_family: qwen3_5_2b
-model_path: ./finetuned/finetuned_100
-method_name: wj
+tokenizer_path: null
+prefer_checkpoint_tokenizer: true
+use_pretrained: false
+reinitialize_weights: false
 
-# Source forget supervision. Target-language forget data is evaluation-only.
+languages: [ko]
+language: ko
+conditions:
+  - no_context
+  - pce_icul
+
 source_language: en
-target_languages: [ko]
-forget_split: forget01
-source_retain_split: retain99
-source_data_path: locuslab/TOFU
+data_root: ./dataset
+split: forget01_perturbed
+english_data_path: locuslab/TOFU
+data_path_by_language: null
 
-# Multilingual retain/utility pools. These should not contain forget01 rows.
-retain_multi_path: ./dataset/retain99_merged_all_10_lang
-utility_multi_path: ./dataset/retain99_merged_all_10_lang
-parallel_anchor_path: ./dataset/retain99_merged_all_10_lang
+# English-only forget supervision.
+# `full_merged_all_10_lang` is filtered to English, and the final 40 examples
+# correspond to the forget01 facts in the local multilingual splits.
+source_forget_data_path: ./dataset/full_merged_all_10_lang
+source_forget_split: train
+source_forget_language: ${source_language}
+source_forget_from_end: 40
+source_forget_question_key: question
+source_forget_answer_key: answer
+forget_profile_size: 20
 
-question_key: question
-answer_key: answer
-max_length: 500
-max_train_examples: null
+# Default counterfactuals are English perturb candidates from the same forget
+# index, so the in-context label flip is aligned with TOFU truth-ratio scoring.
+counterfactual_answer_policy: source_perturb_first
+counterfactual_perturb_fallback_policy: source_slot_swap
+require_perturb_counterfactuals: true
+source_perturbed_forget_data_path: ${english_data_path}
+source_perturbed_forget_split: forget01_perturbed
+source_perturbed_forget_language: ${source_language}
+source_perturbed_forget_from_end: null
+source_perturbed_forget_answer_key: perturbed_answer
+source_perturbed_candidate_index: 0
+pair_forget_by_index: true
 
-# Training
-lr: 2e-5
-batch_size: 1
-gradient_accumulation_steps: 1
-num_epochs: 5
-max_steps: null
-warmup_ratio: 0.03
-weight_decay: 0.01
-adam_epsilon: 1.0e-4
-max_grad_norm: 1.0
-seed: 42
+# Retrieval-gated ICL: apply the PCE prompt only when the query is retrieved as
+# a forget query. `eval_task` is the evaluation-time oracle gate; use `lexical`
+# for a stricter string-overlap gate.
+retrieval_gate: true
+retrieval_gate_mode: eval_task
+retrieval_gate_threshold: 0.35
 
-# Precision and device placement. On Titan XP use fp16=true, bf16=false.
-bf16: false
-fp16: true
-gradient_checkpointing: false
-trainable_param_dtype: float32
-gpu_train: 0
-gpu_ref: 1
+# Retain anchors teach the model that the correction is local, not a global
+# refusal/suppression policy. They are not forget examples.
+retain_anchor_data_path: ./dataset/retain99_merged_all_10_lang
+retain_anchor_split: train
+retain_anchor_source_language: ${source_language}
+retain_anchor_question_key: question
+retain_anchor_answer_key: answer
 
-# Forget objective. `npo` is the default because it is tied to answer likelihood
-# while remaining more stable than pure negative CE.
-forget_objective: npo
-npo_beta: 1.0
+# For forget evaluation: one paired English counterfactual is always used.
+# With the default retrieval gate, retain/real-world queries are evaluated with
+# the normal prompt to measure utility under gated deployment.
+num_extra_forget_cases: 0
+num_unpaired_forget_cases: 0
+num_retain_anchors: 1
+demo_seed: 42
 
-loss_weights:
-  forget: 1.0
-  retain_source_ce: 0.5
-  retain_multi_ce: 0.5
-  utility_multi_ce: 0.25
-  retain_source_kl: 0.1
-  retain_multi_kl: 0.1
-  utility_multi_kl: 0.0
+answer_policy: unknown_short
+include_instruction: true
+max_demo_chars: 160
 
-# Layer selection controls. `middle` is cheap and robust. Switch to
-# `hidden_alignment` to score source-target hidden similarity before LoRA attach.
-layer_selection:
-  strategy: middle_targets  # manual | middle | middle_targets | hidden_alignment
-  selected_layers: null
-  top_k: 6
-  min_layer: 4
-  max_layer: null
-  hidden_alignment_batches: 8
-  hidden_alignment_batch_size: 1
+generation:
+  max_length: 200
+  max_new_tokens: 128
 
-# PEFT LoRA. Selected-layer LoRA is the default update mechanism.
-use_lora: true
-lora_r: 8
-lora_alpha: 16
-lora_dropout: 0.05
-freeze_lora_A: true
-lora_target_modules:
-  - v_proj
-  - o_proj
+input_max_length: 1024
+unicode_normalization: NFC
+normalize_languages:
+  - hi
 
-save_dir: ./finetuned/${method_name}_${forget_objective}_${lr}_${forget_split}_${num_epochs}_${source_language}
-lora_save_dir: ${save_dir}/lora_adapter
-save_merged_model: false
-merged_save_dir: ${save_dir}/merged
-overwrite_dir: false
-save_every_epoch: true
-log_steps: 5
-abort_on_nonfinite: true
-eval_only: false
+save_dir: ./outputs/unlearn_wj/${method_name}_${source_language}_to_${language}
+save_raw_logs: true
+save_generated_text: false
+compute_generation_metrics: false
+save_case_studies: false
+case_study_k: 3
+case_study_seed: 42
+save_legacy_aggregate_stat: false
+save_prompt_samples: true
+prompt_sample_limit: 5
 
-# Optional smoke/full eval command generation uses evaluate_util.py externally.
-eval:
-  languages: [en, ar, fa, fr, hi, id, iw, ja, ko, ru]
-  batch_size: 1
-  perturb_eval_chunk_size: 1
-  ds_size: null
-  save_case_studies: true
+ds_size: null
+overwrite: true
+batch_size: 4
+perturb_eval_chunk_size: 1
+
+question_key: [question, question, question, question]
+answer_key: [answer, answer, answer, answer]
+base_answer_key: [paraphrased_answer, answer, answer, paraphrased_answer]
+perturbed_answer_key: [perturbed_answer, perturbed_answer, perturbed_answer, perturbed_answer]
+eval_task: [eval_log, eval_real_author_wo_options, eval_real_world_wo_options, eval_log_forget]
+
+retain_result: null
+retain_result_by_language: null
+retain_result_template: null
