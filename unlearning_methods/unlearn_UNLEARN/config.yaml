@@ -12,26 +12,35 @@ max_length: 500
 max_train_examples: null
 max_retain_examples: null
 
-rank: 8
+task_model_init: random
+task_model_path: null
+rank: 16
 alpha: 1.0
 unlearn_scale: 1.0
+include_alpha_on_merge: true
 target_modules:
   - q_proj
   - k_proj
   - v_proj
   - o_proj
-  - gate_proj
-  - up_proj
-  - down_proj
 target_layer_start: null
 target_layer_end: null
+sequential_layers: true
+layer_num_epochs: ${num_epochs}
+layer_max_steps: null
+train_val_split: null
+early_stopping_patience: null
 
-use_retain_regularization: true
+use_subspace_discrimination: false
+similar_task_matrix_dir: null
+discrimination_alpha: 0.5
+
+use_retain_regularization: false
 retain_weight: 0.1
 retain_loss_type: kl
 teacher_path: ${model_path}
 
-lr: 1e-4
+lr: 1e-3
 batch_size: 8
 gradient_accumulation_steps: 1
 num_epochs: 3
@@ -60,4 +69,3 @@ gpu_teacher: 1
 teacher_device: auto
 use_deepspeed: false
 deepspeed_config: null
-

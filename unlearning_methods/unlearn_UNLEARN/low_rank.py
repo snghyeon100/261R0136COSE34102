@@ -45,7 +45,7 @@ def _split_parent_child(model, module_name):
     return parent, child_name
 
 
-def _layer_index_from_name(module_name):
+def layer_index_from_name(module_name):
     parts = module_name.split(".")
     for marker in ("layers", "h"):
         if marker in parts:
@@ -58,7 +58,7 @@ def _layer_index_from_name(module_name):
 def _in_layer_range(module_name, start, end):
     if start is None and end is None:
         return True
-    layer_idx = _layer_index_from_name(module_name)
+    layer_idx = layer_index_from_name(module_name)
     if layer_idx is None:
         return False
     if start is not None and layer_idx < int(start):
@@ -98,6 +98,24 @@ def iter_task_modules(model):
     for name, module in model.named_modules():
         if isinstance(module, LowRankTaskLinear):
             yield name, module
+
+
+def task_layers(model):
+    layers = set()
+    for _, module in iter_task_modules(model):
+        layer_idx = layer_index_from_name(module.module_name)
+        if layer_idx is not None:
+            layers.add(layer_idx)
+    return sorted(layers)
+
+
+def set_task_layers_trainable(model, active_layers):
+    active_layers = set(active_layers)
+    for _, module in iter_task_modules(model):
+        layer_idx = layer_index_from_name(module.module_name)
+        active = layer_idx in active_layers
+        module.task_A.requires_grad = active
+        module.task_B.requires_grad = active
 
 
 def task_parameter_count(model):
@@ -146,7 +164,7 @@ def save_task_matrices(model, output_dir):
     return metadata
 
 
-def apply_task_matrices(model, task_matrix_dir, unlearn_scale=1.0, dtype=None):
+def apply_task_matrices(model, task_matrix_dir, unlearn_scale=1.0, dtype=None, include_alpha=True):
     task_matrix_dir = Path(task_matrix_dir)
     with open(task_matrix_dir / "metadata.json", "r") as f:
         metadata = json.load(f)
@@ -156,7 +174,8 @@ def apply_task_matrices(model, task_matrix_dir, unlearn_scale=1.0, dtype=None):
         state = torch.load(task_matrix_dir / entry["file"], map_location="cpu")
         alpha = float(state.get("alpha", entry.get("alpha", 1.0)))
         factor_dtype = dtype or module.weight.dtype
-        task_matrix = (state["A"].to(factor_dtype) @ state["B"].to(factor_dtype)) * (alpha * float(unlearn_scale))
+        scale = float(unlearn_scale) * (alpha if include_alpha else 1.0)
+        task_matrix = (state["A"].to(factor_dtype) @ state["B"].to(factor_dtype)) * scale
         module.weight.data.sub_(task_matrix.to(device=module.weight.device, dtype=module.weight.dtype))
     return len(metadata["modules"])
 
@@ -172,4 +191,3 @@ def assert_only_task_matrices_trainable(model):
     if bad:
         raise RuntimeError(f"Non-task parameters are trainable: {bad[:10]}")
     return trainable
-

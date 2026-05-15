@@ -36,6 +36,7 @@ def _cli_cfg():
             "output_dir": None,
             "tokenizer_path": None,
             "unlearn_scale": 1.0,
+            "include_alpha": True,
             "bf16": True,
         }
     )
@@ -58,7 +59,13 @@ def apply_unlearn_checkpoint(cfg):
         torch_dtype=dtype,
         trust_remote_code=True,
     )
-    changed = apply_task_matrices(model, task_matrix_dir, unlearn_scale=float(cfg.unlearn_scale), dtype=torch.float32)
+    changed = apply_task_matrices(
+        model,
+        task_matrix_dir,
+        unlearn_scale=float(cfg.unlearn_scale),
+        dtype=torch.float32,
+        include_alpha=bool(cfg.include_alpha),
+    )
 
     tokenizer_source = cfg.tokenizer_path or (model_path if Path(model_path, "tokenizer_config.json").exists() else model_cfg["hf_key"])
     tokenizer_source = resolve_project_path(tokenizer_source)
@@ -80,4 +87,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

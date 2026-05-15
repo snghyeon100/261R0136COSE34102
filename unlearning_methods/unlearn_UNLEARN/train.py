@@ -14,15 +14,18 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import hydra
 import torch
+import torch.distributed as dist
 import transformers
 from omegaconf import OmegaConf
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, set_seed
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Trainer, set_seed
 
 from unlearning_methods.unlearn_UNLEARN.dataloader import UNLEARNDataset, unlearn_collator
 from unlearning_methods.unlearn_UNLEARN.low_rank import (
     apply_task_matrices,
     assert_only_task_matrices_trainable,
     save_task_matrices,
+    set_task_layers_trainable,
+    task_layers,
     task_parameter_count,
     wrap_task_matrices,
 )
@@ -123,6 +126,38 @@ def build_model(model_path, model_cfg, dtype, device=None):
     return model
 
 
+def build_task_model(cfg, model_cfg, dtype, device=None):
+    """Build the paper-style task-subspace model.
+
+    UNLEARN identifies task matrices after removing original pretrained
+    weights. The default therefore constructs the architecture from config,
+    leaving weights randomly initialized. Set task_model_init=pretrained to
+    recover the older pretrained/fine-tuned adapter-style behavior.
+    """
+    init_mode = str(cfg.get("task_model_init", "random")).lower()
+    task_model_path = cfg.get("task_model_path", None)
+    if task_model_path is not None:
+        task_model_path = resolve_project_path(task_model_path)
+
+    if init_mode == "random":
+        config_source = task_model_path or model_cfg["hf_key"]
+        config = AutoConfig.from_pretrained(config_source, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_config(
+            config,
+            attn_implementation="flash_attention_2" if model_cfg["flash_attention2"] == "true" else None,
+            trust_remote_code=True,
+        )
+        model = model.to(dtype=dtype)
+    elif init_mode in {"pretrained", "checkpoint"}:
+        model = build_model(task_model_path or resolve_project_path(cfg.model_path), model_cfg, dtype, device=None)
+    else:
+        raise ValueError(f"Unsupported task_model_init={cfg.task_model_init!r}")
+
+    if device is not None:
+        model = model.to(device)
+    return model
+
+
 def resolve_teacher_device(cfg, local_rank, train_device):
     value = str(cfg.get("teacher_device", "auto")).lower()
     if value == "auto":
@@ -146,11 +181,15 @@ def per_device_batch_size(cfg, world_size):
     return max(1, int(cfg.batch_size) // max(1, int(world_size)))
 
 
-def build_training_args(cfg, max_steps, optimizer_steps_per_epoch, world_size):
-    warmup_steps = max(0, int(float(cfg.warmup_ratio) * optimizer_steps_per_epoch * float(cfg.num_epochs)))
+def build_training_args(cfg, max_steps, optimizer_steps_per_epoch, world_size, output_suffix=""):
+    train_epochs = float(cfg.layer_num_epochs) if bool(cfg.sequential_layers) else float(cfg.num_epochs)
+    warmup_steps = max(0, int(float(cfg.warmup_ratio) * optimizer_steps_per_epoch * train_epochs))
     use_cuda_precision = torch.cuda.is_available()
     deepspeed_config = resolve_project_path(cfg.deepspeed_config) if is_deepspeed_enabled(cfg) else None
     per_device_batch = per_device_batch_size(cfg, world_size)
+    output_dir = Path(cfg.save_dir) / "trainer_checkpoints"
+    if output_suffix:
+        output_dir = output_dir / output_suffix
     return transformers.TrainingArguments(
         per_device_train_batch_size=per_device_batch,
         per_device_eval_batch_size=per_device_batch,
@@ -164,7 +203,7 @@ def build_training_args(cfg, max_steps, optimizer_steps_per_epoch, world_size):
         fp16_full_eval=bool(cfg.fp16) and use_cuda_precision,
         logging_steps=max(1, int(cfg.log_steps)),
         logging_dir=str(Path(cfg.save_dir) / "logs"),
-        output_dir=str(Path(cfg.save_dir) / "trainer_checkpoints"),
+        output_dir=str(output_dir),
         optim=str(cfg.optim),
         save_strategy="no",
         ddp_find_unused_parameters=False,
@@ -179,9 +218,10 @@ def build_training_args(cfg, max_steps, optimizer_steps_per_epoch, world_size):
 
 
 class UNLEARNTrainer(Trainer):
-    def __init__(self, *args, teacher_model=None, cfg=None, **kwargs):
+    def __init__(self, *args, teacher_model=None, cfg=None, active_layer=None, **kwargs):
         self.teacher_model = teacher_model
         self.cfg = cfg
+        self.active_layer = active_layer
         super().__init__(*args, **kwargs)
         if bool(self.cfg.use_retain_regularization):
             if self.teacher_model is None:
@@ -192,6 +232,8 @@ class UNLEARNTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         loss, outputs, logs = compute_unlearn_loss(model, self.teacher_model, inputs, self.cfg)
+        if self.active_layer is not None:
+            logs["active_layer"] = torch.tensor(float(self.active_layer), device=loss.device)
         if model.training:
             self.log({key: float(value.detach().float().cpu()) for key, value in logs.items()})
         return (loss, outputs) if return_outputs else loss
@@ -212,11 +254,47 @@ def save_final_unlearned_model(cfg, tokenizer, model_cfg):
         resolve_project_path(cfg.save_task_matrix_dir),
         unlearn_scale=float(cfg.unlearn_scale),
         dtype=torch.float32,
+        include_alpha=bool(cfg.include_alpha_on_merge),
     )
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
     clean_model.save_pretrained(cfg.save_dir)
     tokenizer.save_pretrained(cfg.save_dir)
     return changed
+
+
+def layer_training_steps(cfg, optimizer_steps_per_epoch):
+    if cfg.layer_max_steps is not None:
+        return int(cfg.layer_max_steps)
+    return max(1, math.ceil(float(cfg.layer_num_epochs) * optimizer_steps_per_epoch))
+
+
+def train_one_layer(cfg, model, dataset, layer_idx, optimizer_steps_per_epoch, world_size, teacher_model=None):
+    set_task_layers_trainable(model, [layer_idx])
+    trainable_names = assert_only_task_matrices_trainable(model)
+    max_steps = layer_training_steps(cfg, optimizer_steps_per_epoch)
+    training_args = build_training_args(
+        cfg,
+        max_steps=max_steps,
+        optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+        world_size=world_size,
+        output_suffix=f"layer_{layer_idx}",
+    )
+    trainer = UNLEARNTrainer(
+        model=model,
+        train_dataset=dataset,
+        eval_dataset=dataset,
+        args=training_args,
+        data_collator=unlearn_collator,
+        teacher_model=teacher_model,
+        cfg=cfg,
+        active_layer=layer_idx,
+    )
+    trainer.train()
+    trainer.accelerator.wait_for_everyone()
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    return unwrapped, max_steps, len(trainable_names)
 
 
 @hydra.main(version_base=None, config_path=".", config_name="config")
@@ -229,8 +307,20 @@ def main(cfg):
 
     if cfg.model_path is None:
         cfg.model_path = get_model_identifiers_from_yaml(cfg.model_family)["ft_model_path"]
+    if bool(cfg.use_subspace_discrimination):
+        raise NotImplementedError(
+            "Paper Section 3.2 subspace discrimination is not implemented yet. "
+            "Run with use_subspace_discrimination=false, or add a similar-task task_matrix_dir projection step."
+        )
+    if cfg.train_val_split is not None or cfg.early_stopping_patience is not None:
+        raise NotImplementedError(
+            "Validation-based per-layer early stopping is not implemented yet. "
+            "Use layer_num_epochs/layer_max_steps for fixed-budget layer training."
+        )
     cfg.model_path = resolve_project_path(cfg.model_path)
     cfg.teacher_path = resolve_project_path(cfg.teacher_path)
+    if cfg.task_model_path is not None:
+        cfg.task_model_path = resolve_project_path(cfg.task_model_path)
     cfg.save_dir = resolve_project_path(cfg.save_dir)
     cfg.save_task_matrix_dir = resolve_project_path(cfg.save_task_matrix_dir)
     ensure_save_dir(cfg, rank)
@@ -252,7 +342,7 @@ def main(cfg):
     dtype = pick_dtype(cfg)
     train_device = pick_device(local_rank if world_size > 1 else cfg.gpu_train)
     student_device = None if is_deepspeed_enabled(cfg) else train_device
-    model = build_model(cfg.model_path, model_cfg, dtype, student_device)
+    model = build_task_model(cfg, model_cfg, dtype, student_device)
     model.config.use_cache = False
     if bool(cfg.gradient_checkpointing) or model_cfg["gradient_checkpointing"] == "true":
         model.gradient_checkpointing_enable()
@@ -286,6 +376,8 @@ def main(cfg):
         print(f"effective_global_batch:    {effective_global_batch}")
         print(f"optimizer_steps_per_epoch: {optimizer_steps_per_epoch}")
         print(f"max_steps:                 {max_steps}")
+        print(f"task_model_init:           {cfg.task_model_init}")
+        print(f"sequential_layers:         {cfg.sequential_layers}")
         print(f"wrapped modules:           {len(wrapped_modules)}")
         print(f"trainable params:          {task_parameter_count(model)}")
         print(f"trainable tensors:         {len(trainable_names)}")
@@ -293,32 +385,58 @@ def main(cfg):
         with open(Path(cfg.save_dir) / "wrapped_modules.json", "w") as f:
             json.dump(wrapped_modules, f, indent=2)
 
-    training_args = build_training_args(
-        cfg,
-        max_steps=max_steps,
-        optimizer_steps_per_epoch=optimizer_steps_per_epoch,
-        world_size=world_size,
-    )
-    trainer = UNLEARNTrainer(
-        model=model,
-        train_dataset=dataset,
-        eval_dataset=dataset,
-        args=training_args,
-        data_collator=unlearn_collator,
-        teacher_model=teacher_model,
-        cfg=cfg,
-    )
-
     if bool(cfg.eval_only):
         print("eval_only=true: skipping training.")
     else:
-        trainer.train()
+        if bool(cfg.sequential_layers):
+            layer_records = []
+            for layer_idx in task_layers(model):
+                if rank == 0:
+                    print(f"Training task matrix for layer {layer_idx}")
+                model, layer_steps, layer_trainable_tensors = train_one_layer(
+                    cfg,
+                    model,
+                    dataset,
+                    layer_idx,
+                    optimizer_steps_per_epoch,
+                    world_size,
+                    teacher_model=teacher_model,
+                )
+                layer_records.append(
+                    {
+                        "layer": layer_idx,
+                        "max_steps": layer_steps,
+                        "trainable_tensors": layer_trainable_tensors,
+                    }
+                )
+            if rank == 0:
+                with open(Path(cfg.save_dir) / "layer_training.json", "w") as f:
+                    json.dump(layer_records, f, indent=2)
+        else:
+            training_args = build_training_args(
+                cfg,
+                max_steps=max_steps,
+                optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+                world_size=world_size,
+            )
+            trainer = UNLEARNTrainer(
+                model=model,
+                train_dataset=dataset,
+                eval_dataset=dataset,
+                args=training_args,
+                data_collator=unlearn_collator,
+                teacher_model=teacher_model,
+                cfg=cfg,
+            )
+            trainer.train()
+            trainer.accelerator.wait_for_everyone()
+            model = trainer.accelerator.unwrap_model(trainer.model)
 
     if bool(cfg.save_model) and not bool(cfg.eval_only):
-        trainer.accelerator.wait_for_everyone()
-        unwrapped = trainer.accelerator.unwrap_model(trainer.model)
-        if trainer.is_world_process_zero():
-            save_task_matrices(unwrapped, cfg.save_task_matrix_dir)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        if rank == 0:
+            save_task_matrices(model, cfg.save_task_matrix_dir)
             changed = save_final_unlearned_model(cfg, tokenizer, model_cfg)
             with open(Path(cfg.save_dir) / "training_done.json", "w") as f:
                 json.dump(
@@ -327,12 +445,18 @@ def main(cfg):
                         "dataset_size": len(dataset),
                         "world_size": world_size,
                         "wrapped_modules": len(wrapped_modules),
-                        "task_parameter_count": task_parameter_count(unwrapped),
+                        "task_parameter_count": task_parameter_count(model),
                         "merged_modules": changed,
+                        "task_model_init": str(cfg.task_model_init),
+                        "sequential_layers": bool(cfg.sequential_layers),
+                        "include_alpha_on_merge": bool(cfg.include_alpha_on_merge),
+                        "use_subspace_discrimination": bool(cfg.use_subspace_discrimination),
                     },
                     f,
                     indent=2,
                 )
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
 
 if __name__ == "__main__":
