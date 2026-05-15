@@ -1,0 +1,63 @@
+model_family: qwen3_5_2b
+model_path: ./finetuned
+method_name: UNLEARN
+
+data_path: locuslab/TOFU
+forget_split: forget01
+retain_split: retain99
+language: en
+question_key: question
+answer_key: answer
+max_length: 500
+max_train_examples: null
+max_retain_examples: null
+
+rank: 8
+alpha: 1.0
+unlearn_scale: 1.0
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+target_layer_start: null
+target_layer_end: null
+
+use_retain_regularization: true
+retain_weight: 0.1
+retain_loss_type: kl
+teacher_path: ${model_path}
+
+lr: 1e-4
+batch_size: 8
+gradient_accumulation_steps: 1
+num_epochs: 3
+max_steps: null
+weight_decay: 0.0
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+optim: paged_adamw_32bit
+bf16: true
+fp16: false
+gradient_checkpointing: true
+log_steps: 10
+
+save_dir: ${model_path}/${method_name}_r${rank}_a${alpha}_${forget_split}
+save_task_matrix_dir: ${save_dir}/task_matrix
+save_model: true
+overwrite_dir: false
+eval_while_train: false
+eval_only: false
+seed: 42
+prefer_checkpoint_tokenizer: true
+tokenizer_path: null
+
+gpu_train: 0
+gpu_teacher: 1
+teacher_device: auto
+use_deepspeed: false
+deepspeed_config: null
+
