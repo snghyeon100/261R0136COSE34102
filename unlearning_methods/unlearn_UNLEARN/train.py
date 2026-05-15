@@ -126,7 +126,7 @@ def build_model(model_path, model_cfg, dtype, device=None):
 def resolve_teacher_device(cfg, local_rank, train_device):
     value = str(cfg.get("teacher_device", "auto")).lower()
     if value == "auto":
-        if is_deepspeed_enabled(cfg) and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        if int(os.environ.get("WORLD_SIZE", "1")) > 1:
             return pick_device(local_rank)
         if torch.cuda.is_available() and torch.cuda.device_count() > int(cfg.gpu_teacher):
             return pick_device(cfg.gpu_teacher)
@@ -142,11 +142,15 @@ def resolve_teacher_device(cfg, local_rank, train_device):
     return pick_device(value)
 
 
+def per_device_batch_size(cfg, world_size):
+    return max(1, int(cfg.batch_size) // max(1, int(world_size)))
+
+
 def build_training_args(cfg, max_steps, optimizer_steps_per_epoch, world_size):
     warmup_steps = max(0, int(float(cfg.warmup_ratio) * optimizer_steps_per_epoch * float(cfg.num_epochs)))
     use_cuda_precision = torch.cuda.is_available()
     deepspeed_config = resolve_project_path(cfg.deepspeed_config) if is_deepspeed_enabled(cfg) else None
-    per_device_batch = max(1, int(cfg.batch_size) // max(1, int(world_size)))
+    per_device_batch = per_device_batch_size(cfg, world_size)
     return transformers.TrainingArguments(
         per_device_train_batch_size=per_device_batch,
         per_device_eval_batch_size=per_device_batch,
@@ -239,12 +243,14 @@ def main(cfg):
     tokenizer = load_tokenizer(cfg, model_cfg["hf_key"])
     dataset = UNLEARNDataset(cfg, tokenizer=tokenizer, project_root=PROJECT_ROOT)
 
-    micro_steps_per_epoch = max(1, math.ceil(len(dataset) / (int(cfg.batch_size) * max(1, world_size))))
+    per_device_batch = per_device_batch_size(cfg, world_size)
+    effective_global_batch = per_device_batch * max(1, world_size)
+    micro_steps_per_epoch = max(1, math.ceil(len(dataset) / effective_global_batch))
     optimizer_steps_per_epoch = max(1, math.ceil(micro_steps_per_epoch / int(cfg.gradient_accumulation_steps)))
     max_steps = int(cfg.max_steps) if cfg.max_steps is not None else max(1, math.ceil(float(cfg.num_epochs) * optimizer_steps_per_epoch))
 
     dtype = pick_dtype(cfg)
-    train_device = pick_device(local_rank if is_deepspeed_enabled(cfg) and world_size > 1 else cfg.gpu_train)
+    train_device = pick_device(local_rank if world_size > 1 else cfg.gpu_train)
     student_device = None if is_deepspeed_enabled(cfg) else train_device
     model = build_model(cfg.model_path, model_cfg, dtype, student_device)
     model.config.use_cache = False
@@ -276,6 +282,8 @@ def main(cfg):
     if rank == 0:
         print(f"world_size:                {world_size}")
         print(f"dataset size:              {len(dataset)}")
+        print(f"per_device_batch:          {per_device_batch}")
+        print(f"effective_global_batch:    {effective_global_batch}")
         print(f"optimizer_steps_per_epoch: {optimizer_steps_per_epoch}")
         print(f"max_steps:                 {max_steps}")
         print(f"wrapped modules:           {len(wrapped_modules)}")
